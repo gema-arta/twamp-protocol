@@ -382,12 +382,6 @@ int main(int argc, char *argv[])
     /* Obtain the program name without the full path */
     progname = (progname = strrchr(argv[0], '/')) ? progname + 1 : *argv;
 
-    /* Sanity check */
-    if (getuid() == 0) {
-        fprintf(stderr, "%s should not be run as root\n", progname);
-        exit(EXIT_FAILURE);
-    }
-
     /* Parse options */
     if (parse_options(progname, argc, argv)) {
         usage(progname);
@@ -450,7 +444,7 @@ int main(int argc, char *argv[])
         if (FD_ISSET(listenfd, &tmp_fds)) {
             uint32_t client_len = sizeof(client_addr);
             if ((newsockfd = accept(listenfd,
-                                    (struct sockaddr *)&client_addr, 
+                                    (struct sockaddr *)&client_addr,
                                     &client_len)) < 0) {
                 perror("Error in accept");
             } else {

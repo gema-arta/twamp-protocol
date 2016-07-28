@@ -6,7 +6,10 @@ SRC2 = client.c
 PROGRAM2 = client
 SRCS = timestamp.c
 
-build: server client
+build: server client reflector
+
+reflector:
+	$(CC) -o reflector reflector.cpp $(CCFLAGS) -lstdc++
 
 server:
 	$(CC) -o $(PROGRAM1) $(SRC1) $(SRCS) $(CCFLAGS)
@@ -26,6 +29,6 @@ runclient:
 indent:
 	indent -linux -i4 -ts4 -nut *.c *.h
 
-.PHONY: clean server client build
+.PHONY: clean server client reflector build
 clean:
-	rm -f $(PROGRAM1) $(PROGRAM2) *~
+	rm -f $(PROGRAM1) $(PROGRAM2) reflector *~
