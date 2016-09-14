@@ -8,21 +8,28 @@
  * Note: contains the TWAMP server implementation
  *
  */
+#include <sys/types.h>
+//#undef __FD_SETSIZE
+//#define __FD_SETSIZE 4096
+// The above needs to be hacked in sys/select.h (In Solaris and BSD, you don't
+// need to hack system headers...
+#include <sys/select.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <assert.h>
 
 #include "twamp.h"
 
-#define MAX_CLIENTS 10
-#define MAX_SESSIONS_PER_CLIENT 10
-#define PORTBASE	20000
+#define MAX_CLIENTS 3000
+#define MAX_SESSIONS_PER_CLIENT 1
+#define DEFAULT_TEST_PORT 20000
+#define MAX_NR_SOCKETS 3000
 
 typedef enum {
     kOffline = 0,
@@ -34,6 +41,7 @@ typedef enum {
 struct active_session {
     int socket;
     RequestSession req;
+    uint32_t seq_nr;
 };
 
 struct client_info {
@@ -45,9 +53,12 @@ struct client_info {
     struct active_session sessions[MAX_SESSIONS_PER_CLIENT];
 };
 
+struct client_info clients[MAX_CLIENTS];
+
+int accept_count = 0;
 static int fd_max = 0;
-static int port_min = PORTBASE;
-static int port_max = PORTBASE + 1000;
+static int test_port = DEFAULT_TEST_PORT;
+static int port_override = 0;
 static enum Mode authmode = kModeUnauthenticated;
 static int used_sockets = 0;
 static fd_set read_fds;
@@ -60,7 +71,8 @@ static void usage(char *progname)
 
     fprintf(stderr,
             "	-a authmode		Default is Unauthenticated\n"
-            "	-p port_min		Port range for Test receivers based on port_min\n"
+            "	-p t_port		Custom TWAMP test port. Default port 2000 is used if not specified\n"
+            "	-P c_port  		Custom TWAMP control port. Default port 862 is used if not specified\n"
             "	-h         		Print this help message and exits\n");
     return;
 }
@@ -68,13 +80,13 @@ static void usage(char *progname)
 /* Parses the command line arguments for the server */
 static int parse_options(char *progname, int argc, char *argv[])
 {
-    int opt;
-    if (argc < 1 || argc > 3) {
-        fprintf(stderr, "Wrong number of arguments for %s\n", progname);
+    int opt, c_port;
+    if (argc < 1 || argc > 5) {
+        fprintf(stderr, "Wrong number of arguments for %s. Number of arguments - %d\n", progname, argc);
         return 1;
     }
 
-    while ((opt = getopt(argc, argv, "a:p:h")) != -1) {
+    while ((opt = getopt(argc, argv, "a:p:P:h")) != -1) {
         switch (opt) {
         case 'a':
             /* For now only unauthenticated mode is supported */
@@ -82,13 +94,16 @@ static int parse_options(char *progname, int argc, char *argv[])
             authmode = kModeUnauthenticated;
             break;
         case 'p':
-            /* Set port min */
-            port_min = atoi(optarg);
-            /* We don't allow ports less than 1024 (or negative) or greater than
-             * 65000 because we choose a port random with rand() % 1000 */
-            if (port_min < 1024 || port_min > (65535 - 1000))
-                port_min = PORTBASE;
-            port_max = port_min + 1000;
+            /* Set custom test port if required*/
+            test_port = atoi(optarg);
+            if (test_port < 1024 || test_port > (65535))
+                test_port = DEFAULT_TEST_PORT;
+            break;
+        case 'P':
+            /* Set custom control port if required */
+            c_port = atoi(optarg);
+            if ((c_port > 1024 || c_port < 65535) && (c_port != test_port))
+                port_override = c_port;
             break;
         case 'h':
         default:
@@ -105,7 +120,7 @@ static int parse_options(char *progname, int argc, char *argv[])
  */
 static void cleanup_client(struct client_info *client)
 {
-    fprintf(stderr, "Cleanup client %s\n", inet_ntoa(client->addr.sin_addr));
+    fprintf(stderr, "Cleanup client %s, socket %d\n", inet_ntoa(client->addr.sin_addr), client->socket);
     FD_CLR(client->socket, &read_fds);
     close(client->socket);
     used_sockets--;
@@ -116,6 +131,7 @@ static void cleanup_client(struct client_info *client)
             FD_CLR(client->sessions[i].socket, &read_fds);
             close(client->sessions[i].socket);
             client->sessions[i].socket = -1;
+            client->sessions[i].seq_nr = 0;
             used_sockets--;
         }
     memset(client, 0, sizeof(struct client_info));
@@ -130,7 +146,10 @@ static int find_empty_client(struct client_info *clients, int max_clients)
     int i;
     for (i = 0; i < max_clients; i++)
         if (clients[i].status == kOffline)
+        {
             return i;
+        }
+
     return -1;
 }
 
@@ -157,8 +176,8 @@ static int send_greeting(uint8_t mode_mask, struct client_info *client)
         perror("Failed to send ServerGreeting message");
         cleanup_client(client);
     } else {
-        printf("Sent ServerGreeting message to %s. Result %d\n",
-               inet_ntoa(client->addr.sin_addr), rv);
+        //printf("Sent ServerGreeting message to %s. Result %d\n",
+        //       inet_ntoa(client->addr.sin_addr), rv);
     }
     return rv;
 }
@@ -177,8 +196,8 @@ static int receive_greet_response(struct client_info *client)
         perror("Failed to receive SetUpResponse");
         cleanup_client(client);
     } else {
-        printf("Received SetUpResponse message from %s with mode %d. Result %d\n",
-               inet_ntoa(client->addr.sin_addr), resp.Mode, rv);
+        //printf("Received SetUpResponse message from %s with mode %d. Result %d\n",
+        //       inet_ntoa(client->addr.sin_addr), resp.Mode, rv);
     }
     return rv;
 }
@@ -200,8 +219,8 @@ static int send_start_serv(struct client_info *client, TWAMPTimestamp StartTime)
         cleanup_client(client);
     } else {
         client->status = kConfigured;
-        printf("ServerStart message sent to %s\n",
-               inet_ntoa(client->addr.sin_addr));
+        //printf("ServerStart message sent to %s\n",
+        //       inet_ntoa(client->addr.sin_addr));
     }
     return rv;
 }
@@ -216,8 +235,10 @@ static int send_start_ack(struct client_info *client)
     if (rv <= 0) {
         fprintf(stderr, "[%s] ", inet_ntoa(client->addr.sin_addr));
         perror("Failed to send StartACK message");
-    } else
-        printf("StartACK message sent to %s\n", inet_ntoa(client->addr.sin_addr));
+    } else{
+        //printf("StartACK message sent to %s\n",
+        //inet_ntoa(client->addr.sin_addr));
+    }
     return rv;
 }
 
@@ -261,7 +282,7 @@ static int send_accept_session(struct client_info *client, RequestSession * req)
     memset(&acc, 0, sizeof(acc));
 
     /* Check if there are any slots available */
-    if ((used_sockets < 64) && (client->sess_no < MAX_SESSIONS_PER_CLIENT)) {
+    if ((used_sockets < MAX_NR_SOCKETS) && (client->sess_no < MAX_SESSIONS_PER_CLIENT)) {
         int testfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (testfd < 0) {
             fprintf(stderr, "[%s] ", inet_ntoa(client->addr.sin_addr));
@@ -278,7 +299,7 @@ static int send_accept_session(struct client_info *client, RequestSession * req)
         int check_time = CHECK_TIMES;
         while (check_time-- && bind(testfd, (struct sockaddr *)&local_addr,
                                     sizeof(struct sockaddr)) < 0)
-            local_addr.sin_port = port_min + rand() % 1000;
+            local_addr.sin_port = test_port;
 
         if (check_time > 0) {
             req->ReceiverPort = local_addr.sin_port;
@@ -305,7 +326,7 @@ static int send_accept_session(struct client_info *client, RequestSession * req)
 static int receive_request_session(struct client_info *client,
                                    RequestSession * req)
 {
-    printf("Received RequestTWSession from %s\n", inet_ntoa(client->addr.sin_addr));
+    //printf("Received RequestTWSession from %s\n", inet_ntoa(client->addr.sin_addr));
     int rv = send_accept_session(client, req);
     if (rv <= 0) {
         fprintf(stderr, "[%s] ", inet_ntoa(client->addr.sin_addr));
@@ -323,7 +344,7 @@ static int receive_test_message(struct client_info *client, int session_index)
 {
     struct sockaddr_in addr;
     socklen_t len = sizeof(addr);
-    static uint32_t seq_nr = 0;
+    //static uint32_t seq_nr = 0;
 
     ReflectorUPacket pack_reflect;
     memset(&pack_reflect, 0, sizeof(pack_reflect));
@@ -347,8 +368,8 @@ static int receive_test_message(struct client_info *client, int session_index)
         return rv;
     }
 
-    printf("Received TWAMP-Test message from %s\n", inet_ntoa(addr.sin_addr));
-    pack_reflect.seq_number = htonl(seq_nr++);
+    //printf("Received TWAMP-Test message from %s\n", inet_ntoa(addr.sin_addr));
+    pack_reflect.seq_number = htonl(client->sessions[session_index].seq_nr++);
     pack_reflect.error_estimate = 0x100;  // Multiplier = 1
     pack_reflect.sender_seq_number = pack.seq_number;
     pack_reflect.sender_time = pack.time;
@@ -377,16 +398,13 @@ static int receive_test_message(struct client_info *client, int session_index)
 
 int main(int argc, char *argv[])
 {
+    //assert(sizeof(fd_set) == 512);
+    printf("Modified select() fd setsize: %d\n", __FD_SETSIZE);
+    printf("sizeof(fd_set) %lu", sizeof(fd_set));
     char *progname = NULL;
     srand(time(NULL));
     /* Obtain the program name without the full path */
     progname = (progname = strrchr(argv[0], '/')) ? progname + 1 : *argv;
-
-    /* Sanity check */
-    if (getuid() == 0) {
-        fprintf(stderr, "%s should not be run as root\n", progname);
-        exit(EXIT_FAILURE);
-    }
 
     /* Parse options */
     if (parse_options(progname, argc, argv)) {
@@ -404,12 +422,22 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
+    int yes = 1, control_port;
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1)
+    {
+        perror("Setting SO_REUSEADDR failed");
+        exit(EXIT_FAILURE);
+    }
+
     /* Set Server address and bind on the TWAMP port */
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons(SERVER_PORT);
+
+    control_port = port_override ? port_override : SERVER_PORT;
+    printf("Control port is %d\n", control_port);
+    serv_addr.sin_port = htons(control_port);
 
     used_sockets++;
     if (bind(listenfd, (struct sockaddr *)&serv_addr, sizeof(struct sockaddr)) < 0) {
@@ -418,16 +446,16 @@ int main(int argc, char *argv[])
     }
 
     /* Start listening on the TWAMP port for new TWAMP-Control connections */
-    if (listen(listenfd, MAX_CLIENTS)) {
+    if (listen(listenfd, 128)) {
         perror("Error on listen");
         exit(EXIT_FAILURE);
     }
 
+    printf("Listening on port %d\n", control_port);
+
     FD_ZERO(&read_fds);
     FD_SET(listenfd, &read_fds);
     fd_max = listenfd;
-
-    struct client_info clients[MAX_CLIENTS];
 
     memset(clients, 0, MAX_CLIENTS * sizeof(struct client_info));
 
@@ -437,6 +465,7 @@ int main(int argc, char *argv[])
     FD_ZERO(&tmp_fds);
 
     int rv;
+    printf("FD_SETSIZE %d\n", FD_SETSIZE);
     while (1) {
         tmp_fds = read_fds;
         if (select(fd_max + 1, &tmp_fds, NULL, NULL, NULL) < 0) {
@@ -450,10 +479,11 @@ int main(int argc, char *argv[])
         if (FD_ISSET(listenfd, &tmp_fds)) {
             uint32_t client_len = sizeof(client_addr);
             if ((newsockfd = accept(listenfd,
-                                    (struct sockaddr *)&client_addr, 
+                                    (struct sockaddr *)&client_addr,
                                     &client_len)) < 0) {
                 perror("Error in accept");
             } else {
+                //printf("Accept count: %d, used sockets %d ", accept_count++, used_sockets);
                 /* Add a new client if there are any slots available */
                 int pos = find_empty_client(clients, MAX_CLIENTS);
                 uint8_t mode_mask = 0;
@@ -468,6 +498,11 @@ int main(int argc, char *argv[])
                     if (newsockfd > fd_max)
                         fd_max = newsockfd;
                     mode_mask = 0xFF;
+                }
+                else
+                {
+                    fprintf(stderr, "---------NO FREE CLIENT SLOTS!!!");
+                    exit(1);
                 }
                 rv = send_greeting(mode_mask, &clients[pos]);
             }
@@ -517,8 +552,9 @@ int main(int argc, char *argv[])
                             cleanup_client(&clients[i]);
                         break;
                     case kTesting:
-                        /* In this state can only receive a StopSessions msg */
+                        // In this state can only receive a StopSessions msg
                         memset(buffer, 0, 4096);
+                        //printf("waiting for stopsess, sock %d\n", clients[i].socket);
                         rv = recv(clients[i].socket, buffer, 4096, 0);
                         if (rv <= 0) {
                             cleanup_client(&clients[i]);
